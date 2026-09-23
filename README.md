@@ -42,8 +42,14 @@ cp local-secrets.bat.example local-secrets.bat   # 编辑填入 DB_PASSWORD 等
 
 ## 部署
 
-详见 **[DEPLOYMENT.md](./DEPLOYMENT.md)**：在服务器一次性初始化后，于 GitHub Actions 运行
-**Production Release (Promote)** 即可发布；**Production Status** 巡检、**Production Rollback** 回滚。
+详见 **[DEPLOYMENT.md](./DEPLOYMENT.md)**。首次使用顺序（Actions 页面点按钮即可）：
+
+1. **Server Bootstrap (首次初始化)** —— 只跑一次，在服务器上装 JRE17 / Python3.12 / WinSW / MySQL8，
+   建库、写密钥、注册自启服务（跑之前需先在服务器上开启 OpenSSH，见手册第 3.1 节）。
+2. **Server Cleanup (清理旧代码)** —— 可选，清理服务器上历史遗留的无关目录（默认 `C:\deploy`）。
+3. **Production Release (Promote)** —— 构建并发布，失败自动回滚。
+
+日常运维：**Production Status** 巡检、**Production Rollback** 回滚。
 
 ## 敏感信息说明
 

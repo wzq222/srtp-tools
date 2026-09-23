@@ -12,7 +12,10 @@
 
 ```
 GitHub（push / 手动触发 Actions）
-   │  workflow_dispatch: Server Cleanup / Production Release (Promote) / Status / Rollback
+   │  workflow_dispatch:
+   │    Server Bootstrap（一次性初始化）
+   │    Server Cleanup（清理旧代码）
+   │    Production Release (Promote) / Status / Rollback
    ▼
 GitHub Actions Runner（ubuntu-latest）
    ├─ 构建前端(Vue) → 后端 static 目录
@@ -23,6 +26,7 @@ GitHub Actions Runner（ubuntu-latest）
    ▼
 Windows 服务器（SSH / OpenSSH Server）
    ├─ 解包 → C:\srtp\scripts、C:\srtp\incoming\<version>
+   ├─ bootstrap-server.ps1：装 JRE17 / Python3.12 / WinSW / MySQL8，建库、写密钥、注册服务
    ├─ deploy.ps1：安置版本 → 切换 current junction → 渲染服务定义 → 重启服务
    ├─ WinSW 服务 srtp-server（JVM 跑 Spring Boot）
    ├─ Python 桥接算法（四算法整合优化.py，按路径扫描加载）
@@ -51,7 +55,8 @@ Windows 服务器（SSH / OpenSSH Server）
 - 服务器：Windows Server 2022，公网 IP `8.140.194.254`，≥2 GB 内存（当前 2 GB，已按保守参数配置）。
 - 服务器在 bootstrap 阶段需要**出网**，以下载 JRE 17 / Python 3.12 / MySQL 8 / WinSW（约数百 MB）。
 - 仓库：GitHub，已开启 Actions（Settings → Actions → General → 允许 workflow_dispatch）。
-- 本机不需要 GitHub CLI：文件由 AI 在本仓库生成，你只需 `git push` 并在网页配置 Secrets。
+- 本机不需要 GitHub CLI，也不需要手工 push：**代码已推送到 `main`，9 个 Secrets 已配置好**。
+  后续改动只需在 Actions 页面点按钮（或再 push）；敏感值一律走 Secrets，不入库。
 
 ---
 
@@ -66,71 +71,78 @@ Windows 服务器（SSH / OpenSSH Server）
 | `SSH_USER` | ✅ | 服务器管理员账户名（如 `Administrator`） |
 | `SSH_PRIVATE_KEY` | ✅* | CI 私钥（ed25519/rsa），与放在服务器上的公钥配对 |
 | `SSH_PASSWORD` | ✅* | 管理员密码（与 `SSH_PRIVATE_KEY` 二选一） |
-| `DB_PASSWORD` | ✅ | MySQL root 密码。**首次 bootstrap 用 `-GenerateDbPassword` 生成后回填此处**（见第 3.4 步） |
-| `DB_USERNAME` | ⬜ | 默认 `root` |
-| `DB_URL` | ⬜ | 默认已给（`jdbc:mysql://127.0.0.1:3306/srtp_tsp?...`） |
-| `APP_API_KEY` | ⬜** | 应用 API Key，建议设置 |
-| `JWT_SECRET` | ⬜** | JWT 签名密钥，建议设置 |
+| `DB_PASSWORD` | ✅ | MySQL root 密码。**必须先在这里设定好**，bootstrap 会用它初始化 MySQL 并写入服务器 `.env` |
 
 > `*` 二选一即可，推荐用密钥（`SSH_PRIVATE_KEY`）更安全。
 > `**` 虽非强制，但生产环境强烈建议设置，避免空 Key。
+
+> ⚠️ **不要把密码留到运行时自动生成。** 本仓库是 **Public** 仓库，Actions 日志对所有人可见；
+> 自动生成的随机密码不属于 Secrets，不会被日志脱敏，一旦打印就永久泄露。
+> 因此 `Server Bootstrap` 工作流**刻意不暴露** `bootstrap-server.ps1` 的 `-GenerateDbPassword` 开关，
+> `DB_PASSWORD` 必须先在 Secrets 里定好。
+>
+> 另注：GitHub 的 Repository Secrets **创建后不可回读**（只写）。请自行留存一份明文备份，
+> 否则以后想手工登录 MySQL 会比较麻烦。
+
+当前仓库已配置的 9 个 Secret：`SSH_HOST`、`SSH_PORT`、`SSH_USER`、`SSH_PRIVATE_KEY`、
+`DB_PASSWORD`、`DB_USERNAME`、`DB_URL`、`APP_API_KEY`、`JWT_SECRET`。
 
 这些值**不会**出现在仓库任何文件里：仅存在于 GitHub Secrets 与服务器 ACL 锁定的 `C:\srtp\shared\.env`。
 
 ---
 
-## 3. 服务器首次初始化（一次性，在服务器「远程桌面」以管理员运行）
+## 3. 服务器首次初始化（1 步手工 + 2 步一键）
 
-### 3.1 把 `deploy/` 摆到服务器
+顺序：**3.1 在服务器上开启 OpenSSH（唯一必须手工的一步）** → **3.2 跑 Server Bootstrap 工作流** →
+**3.3 跑 Production Release (Promote)**。
 
-在服务器上获取本仓库（已 Public，可直接下载 zip 或 `git clone`），然后：
+### 3.1 开启 OpenSSH Server（在服务器上操作，唯一手工步骤）
 
-```powershell
-# 在服务器 PowerShell（管理员）中执行
-New-Item -ItemType Directory C:\srtp\scripts -Force | Out-Null
-Copy-Item <仓库>\deploy\scripts\*            C:\srtp\scripts      -Recurse -Force
-Copy-Item <仓库>\deploy\winsw               C:\srtp\scripts\winsw -Recurse -Force
-Copy-Item <仓库>\deploy\sql                 C:\srtp\scripts\sql   -Recurse -Force
-```
-
-### 3.2 准备 CI 用的 SSH 密钥对（在本机）
-
-```bash
-ssh-keygen -t ed25519 -f ~/.ssh/srtp_ci -N ""
-# 公钥内容（cat ~/.ssh/srtp_ci.pub） -> 第 3.3 步的 -PublicKey
-# 私钥内容（cat ~/.ssh/srtp_ci）      -> GitHub Secret SSH_PRIVATE_KEY
-```
-
-### 3.3 启用 OpenSSH Server（服务器管理员）
+SSH 还没通之前，Actions 连不上服务器，所以这一步必须在服务器的**远程桌面 / 云控制台 VNC** 里，
+以**管理员身份**打开 PowerShell，粘贴执行下面这一整行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\srtp\scripts\enable-openssh.ps1 `
-    -PublicKey "ssh-ed25519 AAAA... 你的CI公钥"
+Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null; Set-Service sshd -StartupType Automatic; Start-Service sshd; New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue | Out-Null; Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled True -Action Allow -ErrorAction SilentlyContinue; New-Item -ItemType Directory "$env:ProgramData\ssh" -Force | Out-Null; $k='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILaiP7v7lsEKsN8VGPtx/PGPxJaap/DlxjsZbQesp71V srtp-deploy@github-actions'; $f="$env:ProgramData\ssh\administrators_authorized_keys"; $e=@(); if (Test-Path $f) { $e=@(Get-Content $f -Encoding UTF8) }; if ($e -notcontains $k) { $e+=$k; Set-Content $f -Value $e -Encoding UTF8 }; icacls $f /inheritance:r | Out-Null; icacls $f /grant 'SYSTEM:F' | Out-Null; icacls $f /grant 'BUILTIN\Administrators:F' | Out-Null; Get-Service sshd | Select-Object Name,Status,StartType | Format-Table
 ```
 
-- 若只用密码登录，省略 `-PublicKey`，改用 `SSH_PASSWORD` Secret。
-- 脚本会安装 OpenSSH Server、设自启、放通防火墙 22，并写入 `administrators_authorized_keys`（修正 ACL）。
-- **记得在云控制台安全组放通入方向 `22`**。
+执行结束应看到 `sshd` 的 **Status = Running**。
 
-### 3.4 运行一次性初始化（服务器管理员）
+要点：
 
-```powershell
-# secrets.env 可先留空，或预填 APP_API_KEY / JWT_SECRET
-New-Item -ItemType File C:\srtp\incoming\secrets.env -Force
+- Windows OpenSSH 对**管理员组**账户只认 `C:\ProgramData\ssh\administrators_authorized_keys`，
+  **不会**读取 `C:\Users\<用户>\.ssh\authorized_keys`。上面的命令已直接写入该文件并修正 ACL
+  （必须仅 `SYSTEM` 与 `Administrators` 可访问，否则 sshd 会拒绝密钥登录）。
+- 上面的公钥是**本仓库 CI 专用密钥**的公钥；对应私钥已写入 Secret `SSH_PRIVATE_KEY`。
+  私钥在本机的备份位置：`.workbuddy/ssh/srtp_deploy_ed25519`（该目录已被 `.gitignore` 忽略）。
+- **务必在云控制台的安全组放通入方向 `22` 端口**，否则 Actions 依然连不上。
+- 想改用参数化脚本（逻辑等价）也可以，先把 `deploy/` 放到服务器再执行：
 
-powershell -ExecutionPolicy Bypass -File C:\srtp\scripts\bootstrap-server.ps1 `
-    -EnvFile C:\srtp\incoming\secrets.env -GenerateDbPassword
-```
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File C:\srtp\scripts\enable-openssh.ps1 `
+      -PublicKey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILaiP7v7lsEKsN8VGPtx/PGPxJaap/DlxjsZbQesp71V srtp-deploy@github-actions"
+  ```
 
-脚本会：下载并安装 JRE17 / Python3.12 / WinSW / MySQL8 → 初始化 `srtp_tsp` 库（来自 `schema.sql`）→
-写并 ACL 锁定 `C:\srtp\shared\.env`。
+### 3.2 运行 Server Bootstrap（Actions，一键）
 
-> ⚠️ **屏幕上会打印生成的 MySQL root 密码，只显示这一次。请立即把它填入 GitHub Secret `DB_PASSWORD`。**
-> 该密码需与服务器 `.env` 中的 `DB_PASSWORD` 一致，Spring Boot 才能连上 MySQL。
-> 如果你更希望自己定密码：在 `secrets.env` 里先写好 `DB_PASSWORD=你的密码`，然后**不带** `-GenerateDbPassword` 运行，
-> 并把同一个值填到 Secret `DB_PASSWORD`。
+Actions → **Server Bootstrap (首次初始化)** → **Run workflow**（默认参数即可）。
 
-### 3.5 验证初始化
+它会自动完成：
+
+1. 校验 / 启动 `sshd`
+2. 下载安装 **JRE 17**（Temurin 便携版）→ `C:\srtp\tools\jre17`
+3. 安装 **Python 3.12** → `C:\srtp\tools\python312`（numpy 为可选，失败不阻断）
+4. 下载安装 **WinSW** → `C:\srtp\service\srtp-server.exe`
+5. 下载安装 **MySQL 8**（zip 便携版，服务名 `SRTPMySQL`，**仅监听 127.0.0.1**）
+6. 用 Secrets 里的 `DB_PASSWORD` 初始化 MySQL root 密码，并在 `srtp_tsp` 库导入 `schema.sql`
+7. 把 `DB_PASSWORD` / `APP_API_KEY` / `JWT_SECRET` 等写入 **ACL 锁定**的 `C:\srtp\shared\.env`，
+   并渲染 WinSW 服务定义
+8. 幂等：已装好的组件会自动跳过，可安全重复执行
+
+> 首次运行较慢（需下载约 300MB 安装包，期间日志可能长时间无输出），工作流超时已设为 60 分钟。
+
+### 3.3 验证初始化
+
+Actions → **Production Status**（只读巡检），或在服务器上直接运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\srtp\scripts\status.ps1
@@ -146,14 +158,19 @@ powershell -ExecutionPolicy Bypass -File C:\srtp\scripts\status.ps1
 
 | 工作流 | 用途 | 关键输入 |
 | --- | --- | --- |
+| **Server Bootstrap (首次初始化)** | **只跑一次**：装 JRE/Python/WinSW/MySQL，建库、写密钥、注册服务 | `skip_jre` / `skip_python` / `skip_mysql`、`app_port` |
 | **Server Cleanup (清理旧代码)** | 部署前清理服务器上以前的无关代码 | `paths`（要删的绝对路径，每行一个）、`dry_run`（先预览再真删） |
 | **Production Release (Promote)** | 完整构建并部署（或仅同步密钥） | `env_only`（仅同步密钥并重启）、`version_suffix`、`skip_tests`、`cleanup_paths`（可选，部署前顺带清理） |
 | **Production Status** | 只读巡检，输出 JSON 到 Summary | `fail_if_down`（不健康则失败）、`app_port` |
 | **Production Rollback** | 回滚版本 | `target`（`previous` 或版本号）、`list_only` |
 
+- **首次使用顺序**：`Server Bootstrap` → `Server Cleanup`（可选）→ `Production Release (Promote)`。
+  三个工作流共用同一个 `srtp-production` 并发组，不会互相打断。
+
 - **部署前清理旧代码**：先运行 **Server Cleanup**，`dry_run` 先设为 `true` 预览将要删除的内容（含每个路径的大小），确认无误后再设为 `false` 真正删除。该工作流**只删除你列出的路径**，并内置受保护路径黑名单（`C:\` 根、`C:\Windows`、`C:\Program Files`、`C:\ProgramData`、`C:\Users`、`C:\srtp`），命中即跳过，绝不会误删系统或现有部署目录。详见第 4.5 节。
 
-- **首次部署**：直接运行 Promote（默认完整部署）。`deploy.ps1` 会把 jar 安置到 `releases/<version>`、注册并启动服务、做健康检查；失败会自动回滚到上一版本。
+- **首次部署**：先跑完 `Server Bootstrap`，再运行 Promote（默认完整部署）。`deploy.ps1` 会把 jar
+  安置到 `releases/<version>`、注册并启动服务、做健康检查；失败会自动回滚到上一版本。
 - **改了 Secrets 后**：运行 Promote 并勾选 `env_only`，无需重新构建即可把新密钥下发并重启服务。
 - **Production** 环境（Settings → Environments）可配置"必须人工批准"，给 Promote / Rollback 加审批门禁。
 
@@ -215,6 +232,10 @@ powershell -ExecutionPolicy Bypass -File C:\srtp\scripts\rollback.ps1 -ListOnly
 
 | 现象 | 排查 |
 | --- | --- |
+| Actions 卡在「配置 SSH 连接」/ `Connection refused` | 服务器 sshd 未开或安全组没放通 22。回第 3.1 步 |
+| SSH 连上但密钥被拒（`Permission denied (publickey)`） | 公钥没写进 `C:\ProgramData\ssh\administrators_authorized_keys`，或该文件 ACL 不对（必须仅 SYSTEM / Administrators）。用第 3.1 步的整行命令重跑一次 |
+| `SSH_USER` 不对 | 默认按 `Administrator` 配置。若你的管理员账户名不同，改 Secret `SSH_USER`（注意必须属于 Administrators 组，否则不会读 `administrators_authorized_keys`） |
+| Bootstrap 报 `OpenSSH Server 未安装，初始化终止` | 同上，先做第 3.1 步 |
 | 服务起不来 / 启动即退 | 看 `C:\srtp\logs\srtp-server.out.log`、`C:\srtp\logs\deploy.log` |
 | 健康检查失败（自动回滚） | jar 缺依赖、端口被占、或 `.env` 中 `DB_PASSWORD` 与 MySQL 实际 root 密码不一致 |
 | MySQL 起不来 | bootstrap 会提示是否缺 VC++ 2019 运行库；看 `C:\srtp\logs\mysql-error.log`。必要时安装 `vc_redist.x64.exe` |
