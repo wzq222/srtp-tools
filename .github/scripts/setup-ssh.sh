@@ -21,8 +21,10 @@ if [ -n "${SSH_KEY:-}" ]; then
 
   cat > /usr/local/bin/rsh <<'EOF'
 #!/usr/bin/env bash
+# ServerAliveCountMax 放宽到 20（=10 分钟静默容忍）：
+# bootstrap 下载 JRE/Python/MySQL 约 300MB，期间远端可能长时间无输出
 exec ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 \
-  -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
   -p "${SSH_PORT}" -i "${HOME}/.ssh/deploy_key" "${SSH_USER}@${SSH_HOST}" "$@"
 EOF
 
@@ -42,7 +44,7 @@ else
   cat > /usr/local/bin/rsh <<'EOF'
 #!/usr/bin/env bash
 exec sshpass -e ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 \
-  -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
   -o PreferredAuthentications=password -o PubkeyAuthentication=no \
   -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}" "$@"
 EOF

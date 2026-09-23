@@ -1,0 +1,122 @@
+# ==========================================================================
+#  Server Bootstrap —— Windows 服务器一次性初始化
+#
+#  作用：在服务器上装好运行 SRTP 所需的一切（JRE17 / Python3.12 / WinSW /
+#        MySQL8），创建 C:\srtp 目录布局，写入 ACL 锁定的密钥文件，
+#        并注册开机自启的 Windows 服务。
+#
+#  ⚠️ 跑之前必须先在仓库配置好 Secrets（否则会因缺少 SSH 凭据 / DB_PASSWORD 失败）：
+#        SSH_HOST / SSH_USER / SSH_PORT / (SSH_PRIVATE_KEY 或 SSH_PASSWORD) / DB_PASSWORD
+#     详见 DEPLOYMENT.md 第 2 节。
+#
+#  幂等：已安装的组件会自动跳过，可安全重复执行。
+#
+#  顺序：Server Bootstrap（本工作流） -> Production Release (Promote)
+#
+#  触发：Actions 页面 -> Server Bootstrap -> Run workflow
+# ==========================================================================
+
+name: Server Bootstrap (首次初始化)
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_jre:
+        description: '跳过 JRE 17 安装（已装会自动跳过，一般无需勾选）'
+        type: boolean
+        default: false
+      skip_python:
+        description: '跳过 Python 3.12 安装（已装会自动跳过）'
+        type: boolean
+        default: false
+      skip_mysql:
+        description: '跳过 MySQL 8 安装（使用外部数据库时勾选）'
+        type: boolean
+        default: false
+      app_port:
+        description: '应用端口'
+        required: false
+        default: '8090'
+      mysql_download_url:
+        description: 'MySQL 8 zip 下载地址（留空用脚本内置默认）'
+        required: false
+        default: ''
+      python_version:
+        description: 'Python 版本（留空用脚本内置默认 3.12.10）'
+        required: false
+        default: ''
+
+# 与 Promote / Rollback 共用同一并发组：初始化与发布不允许并行
+concurrency:
+  group: srtp-production
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: 初始化 Windows 服务器
+    runs-on: ubuntu-latest
+    # 使用 production 环境：可在 Settings -> Environments -> production 配置
+    # "必须人工批准"，避免误触初始化
+    environment:
+      name: production
+      url: http://${{ secrets.SSH_HOST }}:${{ inputs.app_port }}
+    # 安装包下载 + MySQL 初始化较慢，给足时间
+    timeout-minutes: 60
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 SSH 连接
+        run: bash ./.github/scripts/setup-ssh.sh
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+
+      - name: 准备密钥文件（从 Repository Secrets 渲染）
+        run: bash ./.github/scripts/render-secrets.sh
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_URL: ${{ secrets.DB_URL }}
+          APP_API_KEY: ${{ secrets.APP_API_KEY }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+
+      - name: 打包并上传（仅部署脚本 + 密钥，不含应用载荷）
+        run: bash ./.github/scripts/pack-and-upload.sh
+        env:
+          ENV_ONLY: 'true'
+
+      - name: 服务器端解包（脚本同步到 C:\srtp\scripts）
+        run: bash ./.github/scripts/remote-unpack.sh
+        env:
+          VERSION: bootstrap
+
+      - name: 执行服务器初始化
+        run: bash ./.github/scripts/remote-bootstrap.sh
+        env:
+          SKIP_JRE: ${{ inputs.skip_jre }}
+          SKIP_PYTHON: ${{ inputs.skip_python }}
+          SKIP_MYSQL: ${{ inputs.skip_mysql }}
+          APP_PORT: ${{ inputs.app_port }}
+          MYSQL_DOWNLOAD_URL: ${{ inputs.mysql_download_url }}
+          PYTHON_VERSION: ${{ inputs.python_version }}
+
+      - name: 写入初始化摘要
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## Server Bootstrap 结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 服务器 | \`${{ secrets.SSH_HOST }}:${{ inputs.app_port }}\` |"
+            echo "| 跳过 JRE | \`${{ inputs.skip_jre }}\` |"
+            echo "| 跳过 Python | \`${{ inputs.skip_python }}\` |"
+            echo "| 跳过 MySQL | \`${{ inputs.skip_mysql }}\` |"
+            echo "| 触发者 | @${{ github.actor }} |"
+            echo ""
+            echo "> 初始化完成后，运行 **Production Release (Promote)** 部署应用。"
+          } >> "$GITHUB_STEP_SUMMARY"
