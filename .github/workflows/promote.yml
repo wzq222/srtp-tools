@@ -149,9 +149,12 @@ jobs:
     runs-on: ubuntu-latest
     # 使用 GitHub 的 production 环境：可在仓库
     # Settings -> Environments -> production 里配置"必须人工批准"等保护规则
-    environment:
-      name: production
-      url: http://${{ secrets.SSH_HOST }}:${{ env.APP_PORT }}
+    #
+    # ⚠️ 不要在这里写 url: http://${{ secrets.SSH_HOST }}:...
+    #    jobs.<job_id>.environment.url 允许的上下文里**没有 secrets**，
+    #    写了会让整个 workflow 文件解析失败（Actions 里名字回退成文件路径、
+    #    每次 push 生成一条 0 job 的失败运行）。需要 URL 就用字面量或 vars。
+    environment: production
     steps:
       - name: 检出代码（获取服务器端部署脚本与 helper）
         uses: actions/checkout@v4

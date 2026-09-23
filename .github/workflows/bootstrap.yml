@@ -57,9 +57,12 @@ jobs:
     runs-on: ubuntu-latest
     # 使用 production 环境：可在 Settings -> Environments -> production 配置
     # "必须人工批准"，避免误触初始化
-    environment:
-      name: production
-      url: http://${{ secrets.SSH_HOST }}:${{ inputs.app_port }}
+    #
+    # ⚠️ 不要在这里写 url: http://${{ secrets.SSH_HOST }}:...
+    #    jobs.<job_id>.environment.url 允许的上下文里**没有 secrets**，
+    #    写了会让整个 workflow 文件解析失败（Actions 里名字回退成文件路径、
+    #    每次 push 生成一条 0 job 的失败运行）。需要 URL 就用字面量或 vars。
+    environment: production
     # 安装包下载 + MySQL 初始化较慢，给足时间
     timeout-minutes: 60
     steps:
