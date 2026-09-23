@@ -1,0 +1,283 @@
+# ==========================================================================
+#  Production Release (Promote) —— 生产发布 / 部署
+#
+#  作用：在 GitHub 上点一下按钮，就把仓库里当前代码构建成发布包，
+#        直接部署到 Windows 服务器（8.140.194.254），并做健康检查。
+#
+#  做了什么：
+#    1. 构建前端(Vue) -> 输出到后端 static 目录
+#    2. 打包后端(Spring Boot) -> 可执行 jar（内含前端）
+#    3. 组装发布载荷（jar + Python 算法桥接 + 算法核心）
+#    4. 上传到服务器，切换版本（current junction）
+#    5. 从 GitHub Secrets 下发密钥 -> 写入服务器 ACL 锁定的 .env
+#    6. 健康检查；不通过自动回滚到上一个版本
+#    7. 打 tag 并创建 GitHub Release（可下载该版本的 jar）
+#
+#  触发：Actions 页面 -> Production Release (Promote) -> Run workflow
+#  依赖的 Secrets：见仓库根目录 DEPLOYMENT.md
+# ==========================================================================
+
+name: Production Release (Promote)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: '版本后缀（可选；留空则自动生成 <pom版本>-<运行号>-<commit短SHA>）'
+        required: false
+        default: ''
+      env_only:
+        description: '只同步密钥/环境变量并重启服务（不构建、不切换版本）'
+        type: boolean
+        default: false
+      skip_tests:
+        description: '跳过后端单元测试'
+        type: boolean
+        default: true
+      cleanup_paths:
+        description: '部署前顺带清理的服务器路径（每行一个，可选；留空则不清理）。默认 C:\deploy 为历史遗留目录，会在部署前自动删除。仅删除列出的路径，受保护路径会被跳过。'
+        required: false
+        default: 'C:\deploy'
+
+# 生产发布不允许并发，避免两个流程同时切换版本
+concurrency:
+  group: srtp-production
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  APP_PORT: '8090'
+  NODE_VERSION: '22'
+  JAVA_VERSION: '17'
+
+jobs:
+  # ==========================================================================
+  #  build —— 构建发布包
+  # ==========================================================================
+  build:
+    name: 构建（前端 + 后端）
+    if: ${{ !inputs.env_only }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 计算发布版本号
+        id: version
+        run: |
+          set -euo pipefail
+          # 取 srtp-server 自己的 <version>（父 pom 的 version 在更前面，需按 artifactId 定位）
+          BASE=$(awk '/<artifactId>srtp-server<\/artifactId>/{f=1} f && /<version>/{gsub(/.*<version>|<\/version>.*/,""); print; exit}' srtp-server/pom.xml)
+          [ -n "$BASE" ] || BASE="1.0.0"
+          SUFFIX="${{ inputs.version_suffix }}"
+          if [ -n "$SUFFIX" ]; then
+            VERSION="${BASE}-${SUFFIX}"
+          else
+            VERSION="${BASE}-${GITHUB_RUN_NUMBER}-$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "本次发布版本：**$VERSION**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: srtp-web/package-lock.json
+
+      - name: 构建前端（Vue -> 后端 static 目录）
+        working-directory: srtp-web
+        run: |
+          npm ci
+          npm run build
+
+      - name: 校验前端产物
+        run: |
+          set -euo pipefail
+          test -f srtp-server/src/main/resources/static/index.html \
+            || { echo "::error::前端产物缺失，构建未写入 static 目录"; exit 1; }
+          echo "static 目录内容："
+          ls -la srtp-server/src/main/resources/static/
+
+      - name: 安装 JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: 构建后端（打包含前端的可执行 jar）
+        working-directory: srtp-server
+        run: |
+          if [ "${{ inputs.skip_tests }}" = "true" ]; then
+            mvn -B -DskipTests package
+          else
+            mvn -B package
+          fi
+
+      - name: 组装发布载荷
+        run: |
+          set -euo pipefail
+          rm -rf staging
+          mkdir -p staging/app/python staging/app/srtp-app-source
+          cp srtp-server/target/srtp-server-*.jar staging/app/srtp-server.jar
+          cp srtp-server/python/algorithm_bridge.py staging/app/python/
+          cp srtp-app-source/*.py staging/app/srtp-app-source/
+          echo "--- 发布载荷 ---"
+          find staging -type f | sort
+          echo "--- jar 大小 ---"
+          ls -lh staging/app/srtp-server.jar
+
+      - name: 上传发布载荷（供 deploy 任务使用）
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-payload
+          path: staging
+          retention-days: 14
+
+  # ==========================================================================
+  #  deploy —— 部署到服务器
+  # ==========================================================================
+  deploy:
+    name: 部署到服务器
+    needs: build
+    if: ${{ always() && (needs.build.result == 'success' || inputs.env_only) }}
+    runs-on: ubuntu-latest
+    # 使用 GitHub 的 production 环境：可在仓库
+    # Settings -> Environments -> production 里配置"必须人工批准"等保护规则
+    environment:
+      name: production
+      url: http://${{ secrets.SSH_HOST }}:${{ env.APP_PORT }}
+    steps:
+      - name: 检出代码（获取服务器端部署脚本与 helper）
+        uses: actions/checkout@v4
+
+      - name: 下载发布载荷
+        if: ${{ !inputs.env_only }}
+        uses: actions/download-artifact@v4
+        with:
+          name: release-payload
+          path: staging
+
+      - name: 解析部署参数
+        id: cfg
+        env:
+          BUILD_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BUILD_VERSION}" ]; then
+            VERSION="${BUILD_VERSION}"
+          else
+            # env_only 模式：版本号不参与切换，仅作为日志标识
+            VERSION="env-sync-${{ github.run_number }}"
+          fi
+          PORT="${{ secrets.SSH_PORT }}"
+          [ -n "$PORT" ] || PORT=22
+          {
+            echo "version=$VERSION"
+            echo "ssh_port=$PORT"
+            echo "short_sha=$(echo '${{ github.sha }}' | cut -c1-7)"
+            echo "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_OUTPUT"
+          echo "部署版本：$VERSION（SSH 端口 $PORT）"
+
+      - name: 配置 SSH 连接
+        run: bash ./.github/scripts/setup-ssh.sh
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+
+      - name: 部署前清理旧代码（可选）
+        if: ${{ inputs.cleanup_paths != '' }}
+        run: bash ./.github/scripts/remote-cleanup.sh
+        env:
+          CLEANUP_PATHS: ${{ inputs.cleanup_paths }}
+          DRY_RUN: 'false'
+
+      - name: 准备密钥文件（从 Repository Secrets 渲染）
+        run: bash ./.github/scripts/render-secrets.sh
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_URL: ${{ secrets.DB_URL }}
+          APP_API_KEY: ${{ secrets.APP_API_KEY }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+
+      - name: 打包并上传到服务器
+        run: bash ./.github/scripts/pack-and-upload.sh
+        env:
+          ENV_ONLY: ${{ inputs.env_only }}
+
+      - name: 解包并更新服务器端脚本
+        run: bash ./.github/scripts/remote-unpack.sh
+        env:
+          VERSION: ${{ steps.cfg.outputs.version }}
+
+      - name: 执行部署（含失败自动回滚）
+        run: bash ./.github/scripts/remote-deploy.sh
+        env:
+          VERSION: ${{ steps.cfg.outputs.version }}
+          COMMIT: ${{ steps.cfg.outputs.short_sha }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_URL: ${{ steps.cfg.outputs.run_url }}
+          ENV_ONLY: ${{ inputs.env_only }}
+
+      - name: 从公网验证服务可访问
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          URL="http://${SSH_HOST}:${{ env.APP_PORT }}/"
+          echo "尝试访问 $URL"
+          for i in $(seq 1 6); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL" || true)
+            echo "第 $i 次: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "公网访问正常" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "公网访问未通过（若安全组未放通 ${{ env.APP_PORT }} 端口，属预期情况）"
+
+      - name: 写入发布摘要
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## Production Release 结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 版本 | \`${{ steps.cfg.outputs.version }}\` |"
+            echo "| Commit | \`${{ steps.cfg.outputs.short_sha }}\` |"
+            echo "| 模式 | ${{ inputs.env_only && '仅同步密钥' || '完整部署' }} |"
+            echo "| 服务器 | \`${{ secrets.SSH_HOST }}:${{ env.APP_PORT }}\` |"
+            echo "| 触发者 | @${{ github.actor }} |"
+            echo ""
+            echo "> 服务器端保留了历史版本，回滚请运行 **Production Rollback** 工作流。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 创建 GitHub Release
+        if: ${{ !inputs.env_only }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: prod-${{ steps.cfg.outputs.version }}
+          name: Production ${{ steps.cfg.outputs.version }}
+          body: |
+            ## 生产发布 ${{ steps.cfg.outputs.version }}
+
+            - Commit: `${{ steps.cfg.outputs.short_sha }}`
+            - 触发者: @${{ github.actor }}
+            - 构建运行: ${{ steps.cfg.outputs.run_url }}
+            - 部署目标: `${{ secrets.SSH_HOST }}:${{ env.APP_PORT }}`
+
+            该版本已部署到服务器，并保留在 `C:\srtp\releases\${{ steps.cfg.outputs.version }}`。
+            如需回滚，请运行 **Production Rollback** 工作流。
+          files: staging/app/srtp-server.jar
+          fail_on_unmatched_files: false

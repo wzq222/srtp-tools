@@ -1,0 +1,78 @@
+# ==========================================================================
+#  Server Cleanup (清理旧代码) —— 部署前清理服务器上的无关历史代码
+#
+#  作用：在部署 SRTP 之前，把服务器上以前用来做别的事情的目录/代码清掉。
+#        - 只删除你在输入框里列出的绝对路径，绝不递归删除整盘
+#        - 服务端脚本内置受保护路径黑名单（C:\ / Windows / Program Files /
+#          ProgramData / Users / srtp），命中即跳过，保护系统与现有部署
+#        - 建议第一次先用 dry_run=true 预览将要删除的内容，确认无误再 false 真删
+#
+#  触发：Actions 页面 -> Server Cleanup -> Run workflow
+#  依赖的 Secrets：见仓库根目录 DEPLOYMENT.md（SSH_* 系列）
+# ==========================================================================
+
+name: Server Cleanup (清理旧代码)
+
+on:
+  workflow_dispatch:
+    inputs:
+      paths:
+        description: '要清理的服务器绝对路径，每行一个。例如：C:\old-app 或 C:\inetpub\wwwroot\legacy。仅删除这里列出的路径。默认清理服务器上历史遗留的 C:\deploy 目录。'
+        required: true
+        type: string
+        default: 'C:\deploy'
+      dry_run:
+        description: 'true=只列出/统计将要删除的内容，不真删（建议先跑一次预览）；false=真正删除'
+        type: boolean
+        default: true
+
+# 与生产发布共用并发组，避免清理和部署同时进行
+concurrency:
+  group: srtp-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    name: 清理服务器旧代码
+    runs-on: ubuntu-latest
+    # production 环境可配置人工批准等保护规则
+    environment:
+      name: production
+    steps:
+      - name: 检出代码（获取 helper 脚本）
+        uses: actions/checkout@v4
+
+      - name: 配置 SSH 连接
+        run: bash ./.github/scripts/setup-ssh.sh
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+
+      - name: 执行清理（dry_run=${{ inputs.dry_run }}）
+        run: bash ./.github/scripts/remote-cleanup.sh
+        env:
+          CLEANUP_PATHS: ${{ inputs.paths }}
+          DRY_RUN: ${{ inputs.dry_run }}
+
+      - name: 写入摘要
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## Server Cleanup 结果"
+            echo ""
+            echo "- 模式：**${{ inputs.dry_run && '预览（未删除）' || '已删除' }}**"
+            echo "- 触发者：@${{ github.actor }}"
+            echo "- 目标路径（来自输入）："
+            echo '```'
+            echo "${{ inputs.paths }}"
+            echo '```'
+            echo ""
+            echo "> 解析后的逐路径明细见上方步骤日志与 \`cleanup-result.json\`。"
+            echo "> 若本次为预览且确认无误，请再次运行本工作流并将 dry_run 设为 false。"
+          } >> "$GITHUB_STEP_SUMMARY"

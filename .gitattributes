@@ -1,0 +1,30 @@
+# 默认：仓库内统一 LF，检出时按平台自动转换
+* text=auto
+
+# 源码
+*.java    text eol=lf
+*.py      text eol=lf
+*.js      text eol=lf
+*.vue     text eol=lf
+*.css     text eol=lf
+*.html    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.md      text eol=lf
+*.sql     text eol=lf
+*.xml     text eol=lf
+*.sh      text eol=lf
+
+# Windows 脚本必须 CRLF，否则 cmd/PowerShell 执行异常
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf
+
+# 二进制
+*.jar     binary
+*.png     binary
+*.jpg     binary
+*.ico     binary
+
+# 让含中文的文件名在 git status 中正常显示
+# （建议同时执行: git config --global core.quotepath false）

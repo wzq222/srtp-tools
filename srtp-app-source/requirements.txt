@@ -1,0 +1,19 @@
+# SRTP Desktop - Python Dependencies
+# ====================================
+# These are the Python packages used by the SRTP backend server
+# and the GUI application.
+
+# Core libraries (standard library - no pip install needed):
+# argparse, hashlib, hmac, json, math, mimetypes, os, random, re,
+# secrets, sqlite3, sys, threading, time, webbrowser,
+# concurrent.futures, datetime, http.server, pathlib, urllib.parse,
+# tkinter, csv, heapq, dataclasses
+
+# External dependencies:
+numpy>=1.26.0
+openpyxl>=3.1.0
+python-docx>=1.0.0
+Pillow>=10.0.0
+
+# For building the executable (optional):
+# pyinstaller>=6.0.0

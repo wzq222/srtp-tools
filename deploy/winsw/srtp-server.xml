@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ============================================================
+   SRTP Server —— WinSW 服务定义模板
+   由 deploy.ps1 在部署时渲染为 C:\srtp\service\srtp-server.xml：
+     __JRE__        -> C:\srtp\tools\jre17
+     __CURRENT__    -> C:\srtp\current          （junction，指向当前发布版本）
+     __LOGS__       -> C:\srtp\logs
+     __ENV_BLOCK__  -> 从 C:\srtp\shared\.env 生成的 <env> 列表
+  注意：请勿手工修改渲染后的 srtp-server.xml，下次部署会被覆盖。
+  ============================================================
+-->
+<service>
+  <id>srtp-server</id>
+  <name>SRTP TSP Algorithm Platform</name>
+  <description>SRTP TSP 算法平台后端（Spring Boot 3.2 + Python 算法桥接），由 GitHub Actions 自动部署。</description>
+
+  <executable>__JRE__\bin\java.exe</executable>
+
+  <!-- 2 vCPU / 2GB 内存服务器上的保守 JVM 参数；如需调大请同步确认 MySQL 占用 -->
+  <arguments>-Xms128m -Xmx448m -XX:MaxMetaspaceSize=160m -XX:+UseSerialGC -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=__LOGS__ -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai -jar srtp-server.jar</arguments>
+
+  <!-- 工作目录必须是 current\app：后端据此解析 python/algorithm_bridge.py，
+       而该脚本又要求 srtp-app-source 与 srtp-server 同级 -->
+  <workingdirectory>__CURRENT__\app</workingdirectory>
+
+  <!-- ============ 环境变量（由 .env 渲染，含数据库密码 / API Key） ============ -->
+  __ENV_BLOCK__
+
+  <logpath>__LOGS__</logpath>
+  <log mode="roll-by-size-time">
+    <sizeThreshold>10485760</sizeThreshold>
+    <pattern>yyyyMMdd</pattern>
+    <autoRollAtTime>00:00:00</autoRollAtTime>
+    <zipOlderThanNumDays>14</zipOlderThanNumDays>
+  </log>
+
+  <!-- 进程异常退出时自动重启 -->
+  <onfailure action="restart" delay="10 sec" />
+  <onfailure action="restart" delay="30 sec" />
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- 服务停止时给应用 40 秒优雅退出时间 -->
+  <stoptimeout>40 sec</stoptimeout>
+
+  <!-- 开机自启：如需改为手动启动，把 Automatic 改成 Manual -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <priority>Normal</priority>
+</service>

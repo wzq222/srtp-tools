@@ -1,0 +1,99 @@
+# ==========================================================================
+#  Production Status —— 服务器状态巡检（只读，不改动任何配置）
+#
+#  作用：从 GitHub 一键拉取服务器运行状态，输出结构化 JSON 到 Summary。
+#        可配合 FailIfDown 在 CI 中做"服务是否存活"的断言。
+#
+#  触发：Actions 页面 -> Production Status -> Run workflow
+#  依赖的 Secrets：SSH_HOST / SSH_USER / 以及 SSH_PRIVATE_KEY 或 SSH_PASSWORD
+# ==========================================================================
+
+name: Production Status
+
+on:
+  workflow_dispatch:
+    inputs:
+      fail_if_down:
+        description: '服务不健康时让本次运行失败（可用于监控/心跳）'
+        type: boolean
+        default: false
+      app_port:
+        description: '应用端口（默认 8090）'
+        required: false
+        default: '8090'
+
+concurrency:
+  group: srtp-status
+  cancel-in-progress: true
+
+jobs:
+  status:
+    name: 巡检服务器状态
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码（获取 SSH helper）
+        uses: actions/checkout@v4
+
+      - name: 配置 SSH 连接
+        run: bash ./.github/scripts/setup-ssh.sh
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+
+      - name: 执行状态巡检
+        id: check
+        run: |
+          set -euo pipefail
+          PORT="${{ inputs.app_port }}"
+          [ -n "$PORT" ] || PORT=8090
+
+          ARG=""
+          if [ "${{ inputs.fail_if_down }}" = "true" ]; then
+            ARG=' -FailIfDown'
+          fi
+
+          # 远端已通过 bootstrap-server.ps1 安装好 C:\srtp\scripts\status.ps1
+          set +e
+          OUT=$(rsh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\srtp\scripts\status.ps1 -AppPort $PORT$ARG" 2>&1)
+          RC=$?
+          set -e
+          echo "$OUT"
+
+          # 提取结构化 JSON（===SRTP_STATUS_JSON_BEGIN=== ... ===END===）
+          JSON=$(printf '%s\n' "$OUT" | awk '
+            /===SRTP_STATUS_JSON_BEGIN===/ { f=1; next }
+            /===SRTP_STATUS_JSON_END===/   { f=0 }
+            f { print }
+          ')
+          if [ -z "$JSON" ]; then
+            echo "::error::未从服务器收到状态 JSON（连接或脚本可能失败）"
+            exit 1
+          fi
+
+          {
+            echo "## 服务器状态 @ $(date +%FT%T%z)"
+            echo ""
+            echo '```json'
+            echo "$JSON"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 健康断言
+          HEALTHY=$(printf '%s' "$JSON" | grep -o '"healthy"[^,}]*' | head -1 | grep -o 'true\|false' || true)
+          echo "health 标记: ${HEALTHY:-unknown}"
+          if [ "${{ inputs.fail_if_down }}" = "true" ]; then
+            if [ "$RC" -ne 0 ] || [ "$HEALTHY" != "true" ]; then
+              echo "::error::服务不健康（RC=$RC, healthy=$HEALTHY）"
+              exit 1
+            fi
+            echo "服务存活，健康检查通过"
+          fi
+
+      - name: 提示
+        if: ${{ always() }}
+        run: |
+          echo "详细 JSON 已写入上方 Step Summary。"
+          echo "提示：如需回滚，请运行 **Production Rollback** 工作流。"

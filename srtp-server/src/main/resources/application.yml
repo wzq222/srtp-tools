@@ -1,0 +1,76 @@
+# ============================================================
+# 所有敏感项均通过环境变量注入，仓库内不保存任何明文凭据。
+# 本地开发：把值写在 srtp-server/local-secrets.bat（已被 .gitignore 忽略），
+#           由 start.bat 自动加载。
+# 服务器部署：由 GitHub Actions 从 Repository Secrets 下发，
+#           写入 C:\srtp\shared\.env（ACL 锁定，仅 SYSTEM/Administrators 可读）。
+# 完整变量清单见 DEPLOYMENT.md。
+# ============================================================
+server:
+  port: ${SERVER_PORT:8090}
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+    session:
+      cookie:
+        http-only: true
+        same-site: lax
+
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:mysql://127.0.0.1:3306/srtp_tsp?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=UTF-8}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      pool-name: SRTP-HikariPool
+      maximum-pool-size: 20
+      minimum-idle: 5
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      connection-timeout: 30000
+      validation-timeout: 5000
+      keepalive-time: 120000
+      leak-detection-threshold: 60000
+
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    default-property-inclusion: non_null
+
+  session:
+    jdbc:
+      initialize-schema: never
+      table-name: SPRING_SESSION
+    timeout: 30m
+
+# Python configuration
+# 算法桥接脚本：${script-dir}/algorithm_bridge.py，以本进程工作目录为基准解析。
+# 该脚本要求算法核心目录 srtp-app-source 与 srtp-server 为同级目录。
+# 本地开发：用 local-secrets.bat 指定本机 Python。
+# 服务器：指向 C:\srtp\tools\python312\python.exe（自带 numpy）。
+python:
+  executable: ${PYTHON_EXECUTABLE:python}
+  script-dir: ${PYTHON_SCRIPT_DIR:python}
+
+# 外部服务 API Key，由部署环境注入（服务器上保存于 ACL 锁定的 .env）。
+# 留空即为不启用；后续接入第三方接口时直接读取 app.api-key 使用。
+app:
+  api-key: ${APP_API_KEY:}
+
+# 健康检查端点：部署流水线（GitHub Actions）据此判定部署成功/触发自动回滚
+# 仅暴露 health，且不展示细节，避免泄露数据库等内部信息
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+logging:
+  level:
+    com.srtp: DEBUG
+    org.springframework.jdbc: INFO

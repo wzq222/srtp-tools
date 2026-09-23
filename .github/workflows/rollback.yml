@@ -1,0 +1,121 @@
+# ==========================================================================
+#  Production Rollback —— 版本回滚
+#
+#  作用：把服务器上的服务切回「上一个版本」或指定的历史版本。
+#        回滚会切换 C:\srtp\current junction 并重启服务，健康检查通过后才算成功；
+#        若失败则自动尝试切回回滚前的版本。
+#
+#  触发：Actions 页面 -> Production Rollback -> Run workflow
+#  输入：
+#    target    previous   -> 回滚到上一个版本（默认）
+#              <版本号>   -> 回滚到指定版本，例如 1.0.0-42-a1b2c3d
+#    list_only true       -> 只列出可回滚的版本，不做任何改动
+#  依赖的 Secrets：SSH_HOST / SSH_USER / 以及 SSH_PRIVATE_KEY 或 SSH_PASSWORD
+# ==========================================================================
+
+name: Production Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '回滚目标：previous（上一个版本）或具体版本号'
+        required: false
+        default: 'previous'
+      list_only:
+        description: '只列出可回滚的版本，不执行回滚'
+        type: boolean
+        default: false
+
+# 回滚与发布互斥，避免同一时刻两个流程切换版本/服务
+concurrency:
+  group: srtp-production
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: 回滚到指定版本
+    runs-on: ubuntu-latest
+    # 破坏性操作，复用 production 环境（若配置了"必须人工批准"则先审批）
+    environment:
+      name: production
+    steps:
+      - name: 检出代码（获取 SSH helper）
+        uses: actions/checkout@v4
+
+      - name: 校验输入
+        run: |
+          set -euo pipefail
+          T="${{ inputs.target }}"
+          [ -n "$T" ] || { echo "::error::target 不能为空"; exit 1; }
+          # 白名单：previous 或 版本号（字母/数字/./-/_），防止命令注入
+          if [ "$T" != "previous" ] && ! printf '%s' "$T" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "::error::target 非法：$T（只允许 previous 或 版本号）"
+            exit 1
+          fi
+          echo "回滚目标：$T"
+
+      - name: 配置 SSH 连接
+        run: bash ./.github/scripts/setup-ssh.sh
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+
+      - name: 执行回滚
+        id: rb
+        run: |
+          set -euo pipefail
+          T="${{ inputs.target }}"
+          LISTARG=""
+          if [ "${{ inputs.list_only }}" = "true" ]; then
+            LISTARG=" -ListOnly"
+          fi
+
+          # 远端已通过 bootstrap-server.ps1 安装好 C:\srtp\scripts\rollback.ps1
+          CMD=$(printf 'powershell -NoProfile -ExecutionPolicy Bypass -File C:\srtp\scripts\rollback.ps1 -Target "%s"%s' "$T" "$LISTARG")
+
+          set +e
+          OUT=$(rsh "$CMD" 2>&1)
+          RC=$?
+          set -e
+          echo "$OUT"
+
+          JSON=$(printf '%s\n' "$OUT" | awk '
+            /===SRTP_ROLLBACK_JSON_BEGIN===/ { f=1; next }
+            /===SRTP_ROLLBACK_JSON_END===/   { f=0 }
+            f { print }
+          ')
+          if [ -n "$JSON" ]; then
+            {
+              echo "## 回滚结果"
+              echo ""
+              echo '```json'
+              echo "$JSON"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "${{ inputs.list_only }}" = "true" ]; then
+            echo "仅为列举，未做改动（RC=$RC）"
+            exit 0
+          fi
+
+          if [ -z "$JSON" ]; then
+            echo "::error::未从服务器收到回滚结果 JSON（连接或脚本可能失败）"
+            exit 1
+          fi
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::回滚失败（RC=$RC），详见上方服务器日志"
+            exit 1
+          fi
+          echo "回滚完成，结果见上方 Step Summary。"
+
+      - name: 回滚后状态巡检
+        if: ${{ !inputs.list_only }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          rsh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\srtp\scripts\status.ps1 -FailIfDown" 2>&1 || true
